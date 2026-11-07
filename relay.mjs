@@ -20,7 +20,10 @@ const MAX_LIMIT = 5000;
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------- allowlist ----------
-let allowed = new Set();
+let admins = new Set(); // keys in allowlist.txt
+let allowed = new Set(); // admins + members added by admins through the app
+const MEMBERS_KIND = 30000;
+const MEMBERS_D = 'binoculars-members';
 function toHex(s) {
   s = s.trim();
   if (!s || s.startsWith('#')) return null;
@@ -38,10 +41,10 @@ function loadAllowlist() {
     const hex = toHex(line.split(/\s/)[0] || '');
     if (hex) next.add(hex);
   }
-  allowed = next;
-  console.log(`allowlist: ${allowed.size} key(s)`);
+  admins = next;
+  recomputeAllowed();
+  console.log(`admins: ${admins.size} key(s), members: ${allowed.size}`);
 }
-loadAllowlist();
 fs.watchFile(ALLOWLIST_FILE, { interval: 2000 }, loadAllowlist);
 
 // ---------- storage ----------
@@ -65,7 +68,21 @@ const q = {
   delTags: db.prepare('DELETE FROM tags WHERE id = ?'),
   getById: db.prepare('SELECT pubkey FROM events WHERE id = ?'),
   replaceable: db.prepare('SELECT id, created_at FROM events WHERE pubkey = ? AND kind = ? AND d IS ?'),
+  membersLists: db.prepare('SELECT raw FROM events WHERE kind = ? AND d = ?'),
 };
+
+function recomputeAllowed() {
+  const next = new Set(admins);
+  if (typeof q !== 'undefined') {
+    for (const row of q.membersLists.all(MEMBERS_KIND, MEMBERS_D)) {
+      const e = JSON.parse(row.raw);
+      if (!admins.has(e.pubkey)) continue;
+      for (const t of e.tags) if (t[0] === 'p' && /^[0-9a-f]{64}$/.test(t[1] || '')) next.add(t[1]);
+    }
+  }
+  allowed = next;
+}
+loadAllowlist();
 
 const isReplaceable = (k) => k === 0 || k === 3 || (k >= 10000 && k < 20000);
 const isAddressable = (k) => k >= 30000 && k < 40000;
@@ -163,14 +180,86 @@ function matches(f, e) {
 const info = {
   name: 'Binoculars private relay',
   description: 'Private relay for Property Management Binoculars. Members only.',
-  supported_nips: [1, 9, 11, 33, 40, 42],
+  supported_nips: [1, 9, 11, 33, 40, 42, 59],
   software: 'binoculars-relay',
-  version: '0.1.0',
+  version: '0.2.0',
   limitation: { auth_required: true, restricted_writes: true, max_message_length: MAX_EVENT_BYTES },
 };
 
+// ---------- encrypted file storage (Blossom-style) ----------
+// Files arrive already encrypted by the app. Upload needs a signed kind-24242 auth event from a member.
+const BLOB_DIR = `${DATA_DIR}/blobs`;
+const MAX_BLOB_BYTES = 30 * 1024 * 1024;
+fs.mkdirSync(BLOB_DIR, { recursive: true });
+
+function blobAuth(req, action) {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Nostr ')) return 'missing auth';
+  let e;
+  try {
+    e = JSON.parse(Buffer.from(h.slice(6), 'base64').toString('utf8'));
+  } catch {
+    return 'bad auth';
+  }
+  if (!e || e.kind !== 24242 || !verifyEvent(e)) return 'bad auth event';
+  if (!e.tags.some((t) => t[0] === 't' && t[1] === action)) return 'wrong action';
+  const exp = Number(e.tags.find((t) => t[0] === 'expiration')?.[1] || 0);
+  if (!exp || exp < Date.now() / 1000) return 'auth expired';
+  if (!allowed.has(e.pubkey)) return 'not a member';
+  return null;
+}
+
+function handleBlob(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-SHA-256');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, PUT, OPTIONS');
+  if (req.method === 'OPTIONS') return res.writeHead(204).end();
+
+  if (req.method === 'PUT' && req.url === '/upload') {
+    const err = blobAuth(req, 'upload');
+    if (err) return res.writeHead(401, { 'X-Reason': err }).end(err);
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BLOB_BYTES) {
+        res.writeHead(413).end('file too large');
+        req.destroy();
+      } else chunks.push(c);
+    });
+    req.on('end', () => {
+      if (res.writableEnded) return;
+      const buf = Buffer.concat(chunks);
+      const sha = crypto.createHash('sha256').update(buf).digest('hex');
+      fs.writeFileSync(`${BLOB_DIR}/${sha}`, buf);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ sha256: sha, size: buf.length, url: `${publicHttpUrl()}/${sha}`, uploaded: Math.floor(Date.now() / 1000) }));
+    });
+    return true;
+  }
+
+  const m = req.url.match(/^\/([0-9a-f]{64})(\.[a-z0-9]+)?$/);
+  if (m && (req.method === 'GET' || req.method === 'HEAD')) {
+    const file = `${BLOB_DIR}/${m[1]}`;
+    if (!fs.existsSync(file)) return res.writeHead(404).end('not found');
+    const stat = fs.statSync(file);
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': stat.size, 'Cache-Control': 'public, max-age=31536000, immutable' });
+    if (req.method === 'HEAD') return res.end();
+    fs.createReadStream(file).pipe(res);
+    return true;
+  }
+  return false;
+}
+
+function publicHttpUrl() {
+  return RELAY_URL.replace(/^ws/, 'http').replace(/\/+$/, '');
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') return res.end('ok');
+  if (req.method === 'PUT' || req.method === 'OPTIONS' || /^\/[0-9a-f]{64}/.test(req.url)) {
+    if (handleBlob(req, res) !== false) return;
+  }
   res.setHeader('Access-Control-Allow-Origin', '*');
   if ((req.headers.accept || '').includes('application/nostr+json')) {
     res.setHeader('Content-Type', 'application/nostr+json');
@@ -229,6 +318,7 @@ wss.on('connection', (ws) => {
         return send(['OK', e.id, false, 'error: could not save']);
       }
       send(['OK', e.id, ...result]);
+      if (e.kind === MEMBERS_KIND && dTagOf(e) === MEMBERS_D) recomputeAllowed();
       if (!result[1]) broadcast(e);
       return;
     }
