@@ -1,0 +1,20 @@
+{
+  "name": "binoculars-relay",
+  "version": "0.1.0",
+  "description": "Private Nostr relay for Property Management Binoculars",
+  "main": "relay.mjs",
+  "scripts": {
+    "start": "node relay.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "nostr-tools": "^2.26.0",
+    "ws": "^8.22.1"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  }
+}
